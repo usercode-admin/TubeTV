@@ -49,12 +49,16 @@ Link:
 com/watch?v=dQw4w9WgXcQ) successful
 The video has been played.
 📁 Code Overview
+
 ● scan_network(): Grabs the local interface IP and executes a non-blocking
 socket.connect_ex scan across the /24 subnet.
+
 ● extract_video_id(): Cleans up inputs using regular expressions to isolate the exact
 YouTube video identifier.
+
 ● play_via_adb() / play_via_dial() / play_via_cast(): Underlying execution methods tailored
 to the respective device hardware protocols.
+
 📜 Disclaimer
 This tool is strictly intended for educational exercises, home lab testing, or harmless pranks on
 devices you legally own or have explicit authorization to control. Please use responsibly and do
